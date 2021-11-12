@@ -2,7 +2,7 @@
 // ASL script for Gruntz
 //
 // Author: Tomalla ( http://datashenanigans.pl )
-// Script version: 1.0.0 (2021.10.21)
+// Script version: 1.1.0 (2021.11.11)
 //
 // The script operates in two modes which make the LiveSplit's Game Time be interpreted differently:
 //  * in the "STATS TIME" timing method the LiveSplit's Game Time reflects the actual in-game timer from within the game.
@@ -10,10 +10,18 @@
 //  * in the "LOADLESS TIME" timing method the LiveSplit's Game Time reflects the loadless real time.
 //    In practice the real time is paused only when the level is loading or saving.
 //
+// Changelog:
+//
+// 1.1.0 (2021.11.11)
+//   * complete overhaul of the loadless timer logic
+//   + added hash for Gruntz: v1.01 English NO-CD
+//
+// 1.0.0 (2021.10.21)
+//   * initial commit
+//
 
 state("GRUNTZ")
 {
-	int LevelNumber: 0x2135B0;
 	uint IsPausedFlag: 0x2464C4, 0xC;
 	bool IsPressAnyKeyPrompt: 0x2464C4, 0x2c, 0x4F8;
 	bool IsToolbarEnabled: 0x2464C4, 0x68, 0x400;
@@ -29,11 +37,15 @@ state("GRUNTZ")
 	int WaitCursorCount: 0x2461A0;
 
 	bool IsLevelLoading: 0x2464C4, 0x2C, 0x484;
+
+	// list of status messages at the top-left of the screen
+	int StatusMessagesCount: 0x2464C4, 0x5C, 0xC;
+	uint StatusMessagesHead: 0x2464C4, 0x5C, 0x4;
 }
 
 startup
 {
-	vars.ScriptVersion = "1.0.0";
+	vars.ScriptVersion = "1.1.0";
 
 	vars.GruntzDescription = "";
 	vars.ComponentGameTime = null;
@@ -41,12 +53,8 @@ startup
 	vars.ComponentGruntz = null;
 
 	vars.HashesGruntz = new Dictionary<string, string> {
-		{"199d4613e4587e1d720623dc11569e4d", "v1.01 english"}
-	};
-
-	vars.HashesUser32 = new Dictionary<string, string> {
-		{"3cb074875ac88a7c1010a2a7f9881a8c", "Known USER32.DLL used during testing on Windows 7"}
-		// 5870ea0d6ba8dd6e2008466bdd00e0f4?
+		{"199d4613e4587e1d720623dc11569e4d", "v1.01 english"},
+		{"a61c4d418440b28e7668fb3c2f4f6e09", "v1.01 english no-cd"}
 	};
 
 	// game states mangled RTTI names
@@ -187,14 +195,13 @@ startup
 				vars.ComponentTimingMethod.Settings.Text2 = (vars.TimingMethod == vars.TimingMethodLoadless ? "Loadless Time" : "Stats Time");
 
 			vars.IsDebugMessages = querySetting("DebugMessages");
-				
 		}
 	};
 
 	timer.OnStart += vars.OnStart;
 
 	// settings
-	settings.Add("ResetOnLoad", false, "Reset the timer on level start");
+	settings.Add("ResetOnLoad", true, "Reset the timer on level start");
 	settings.SetToolTip("ResetOnLoad", "If checked the timer will be automatically reset when the level is first loaded. Handy on individual level runs but has to be disabled with full game playthroughs in mind.");
 
 	settings.Add("TimingMethodSync", false, "Set the timing method automatically according to the Current Timing Method");
@@ -257,28 +264,6 @@ init
 				vars.RefreshComponents();
 			}
 		}
-
-		// detecting the USER32.DLL module
-		// different USER32.DLL version may result in a different callstack layout and thus the algorithm for detecting the loading sequence may be rendered invalid
-		var moduleUser32 = modules.FirstOrDefault(module => module.ModuleName.ToLower() == "user32.dll");
-
-		if( moduleUser32 == null )
-		{
-			vars.ShowWarning("Couldn't find the USER32.DLL module.\nThe loadless timing mode may not work properly.");
-			print("[WARNING] Couldn't find the USER32.DLL module.");
-		} else
-		{
-			string hash = vars.GetMD5Hash(moduleUser32.FileName);
-
-			if( vars.HashesUser32.ContainsKey(hash) )
-			{
-				print("[INFO] Detected USER32.DLL release: " + vars.HashesUser32[hash] + " (" + hash + ")");
-			} else
-			{
-				vars.ShowWarning("The AutoSplitter script didn't recognize the version of USER32.DLL.\nThe loadless timing mode may not work properly.");
-				print("[WARNING] Unknown USER32.DLL MD5 hash: " + hash);
-			}
-		}
 	}
 }
 
@@ -295,24 +280,34 @@ update
 		vars.GameTimeSaved = 0;
 	}
 
-	if( !vars.IsLoadingSequence )
+	// analyzing the status messages in the top-left part of the screen
+	// once the quickloading sequence is initiated by the player, the game adds the "Game Quickloaded successfully." string into the message stack
+	List<string> statusMessages = new List<string>();
+
+	if( !vars.IsLoadingSequence && current.StatusMessagesCount > 0 )
 	{
-		// the callstack of the fading function called from within the quickload functionality
-		// for some reason I couldn't use the state fields for that purpose as it wouldn't update
-		// maybe because it's the stack memory section?
-		if( memory.ReadValue<uint>((IntPtr)0x0018F85C) == 0x004FAB21 &&
-			memory.ReadValue<uint>((IntPtr)0x0018F890) == 0x004C8C8E &&
-			memory.ReadValue<uint>((IntPtr)0x0018F8C4) == 0x0048D6E8 &&
-			memory.ReadValue<uint>((IntPtr)0x0018F8D8) == 0x00488766 &&
-			memory.ReadValue<uint>((IntPtr)0x0018F994) == 0x0053D6DD &&
-			memory.ReadValue<uint>((IntPtr)0x0018F9B4) == 0x0053D4D5 &&
-			// ... USER32.DLL callstack ...
-			memory.ReadValue<uint>((IntPtr)0x0018FD9C) == 0x0053DC64 && // the main event loop dispatching messages
-			memory.ReadValue<uint>((IntPtr)0x0018FDD4) == 0x0051CD62 &&
-			memory.ReadValue<uint>((IntPtr)0x0018FF00) == 0x00520CB2
-		)
+		const int messageLengthMax = 100;
+		const string pattern = "Game Quickloaded successfully.";
+
+		statusMessages = new List<string>(current.StatusMessagesCount);
+
+		for(IntPtr addressNode = (IntPtr)current.StatusMessagesHead; addressNode != (IntPtr)0x0; addressNode = (IntPtr)memory.ReadValue<uint>(addressNode))
 		{
-			vars.IsLoadingSequence = true;
+			IntPtr addressMessageStruct = (IntPtr)memory.ReadValue<uint>(addressNode + 0x8);
+			IntPtr addressMessage = (IntPtr)memory.ReadValue<uint>(addressMessageStruct + 0x8);
+
+			string message;
+			bool isSuccess = memory.ReadString(addressMessage, ReadStringType.ASCII, messageLengthMax, out message);
+
+			if( isSuccess && message == pattern )
+			{
+				vars.IsLoadingSequence = true;
+
+				if( !vars.IsDebugMessages )
+					break;
+			}
+
+			statusMessages.Add(message);
 		}
 	}
 
@@ -320,8 +315,9 @@ update
 	// after the game time is set we store it and watch for any changes
 	// once the game time starts ticking it would signify the loading sequence is over
 	if( old.IsLevelLoading && !current.IsLevelLoading )
+	{
 		vars.LoadWatchGameTime = current.GameTime;
-	else if( vars.LoadWatchGameTime != null && current.GameTime > vars.LoadWatchGameTime + 3 )
+	} else if( vars.LoadWatchGameTime != null && current.GameTime > vars.LoadWatchGameTime + 3 )
 	{
 		// during my tests I've found out that the game time might sometimes "flinch" by a millisecond even though the level would not finish loading
 		// for that reason we wait additional 3ms
@@ -347,6 +343,9 @@ update
 			current.GameTimeStatsPage,
 			current.GameTimePaused,
 			current.WaitCursorCount,
+			current.StatusMessagesCount,
+			"0x" + current.StatusMessagesHead.ToString("X8"),
+			String.Join("|", statusMessages),
 			vars.IsLoadingSequence,
 			vars.LoadWatchGameTime,
 			vars.GameTimeSaved
